@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
-from datasets import load_dataset, load_metric
+from datasets import ClassLabel, load_dataset, load_metric
 
 import transformers
 from transformers import (
@@ -40,17 +40,18 @@ from transformers import (
     HfArgumentParser,
     MultiLingAdapterArguments,
     PretrainedConfig,
-    Trainer,
     TrainingArguments,
     default_data_collator,
     set_seed,
 )
+from save_best_trainer import SaveBestTrainer
 from transformers.trainer_utils import is_main_process
 
 
 task_to_keys = {
     "cola": ("sentence", None),
     "mnli": ("premise", "hypothesis"),
+    "mnli-jsonl": ("sentence1", "sentence2"),
     "mrpc": ("sentence1", "sentence2"),
     "qnli": ("question", "sentence"),
     "qqp": ("question1", "question2"),
@@ -73,7 +74,7 @@ class DataTrainingArguments:
     the command line.
     """
 
-    task_name: Optional[str] = field(
+    task_name: str = field(
         default=None,
         metadata={"help": "The name of the task to train on: " + ", ".join(task_to_keys.keys())},
     )
@@ -94,25 +95,22 @@ class DataTrainingArguments:
             "If False, will pad the samples dynamically when batching to the maximum length in the batch."
         },
     )
+    load_format: Optional[str] = field(
+        default="json", metadata={"help": "Whether the input files are csv or a json file."}
+    )
     train_file: Optional[str] = field(
         default=None, metadata={"help": "A csv or a json file containing the training data."}
     )
     validation_file: Optional[str] = field(
         default=None, metadata={"help": "A csv or a json file containing the validation data."}
     )
-
+    test_file: Optional[str] = field(
+        default=None, metadata={"help": "A csv or a json file containing the test data."}
+    )
     def __post_init__(self):
-        if self.task_name is not None:
-            self.task_name = self.task_name.lower()
-            if self.task_name not in task_to_keys.keys():
-                raise ValueError("Unknown task, you should pick one in " + ",".join(task_to_keys.keys()))
-        elif self.train_file is None or self.validation_file is None:
-            raise ValueError("Need either a GLUE task or a training/validation file.")
-        else:
-            extension = self.train_file.split(".")[-1]
-            assert extension in ["csv", "json"], "`train_file` should be a csv or a json file."
-            extension = self.validation_file.split(".")[-1]
-            assert extension in ["csv", "json"], "`validation_file` should be a csv or a json file."
+        self.task_name = self.task_name.lower()
+        if self.task_name not in task_to_keys.keys():
+            raise ValueError("Unknown task, you should pick one in " + ",".join(task_to_keys.keys()))
 
 
 @dataclass
@@ -198,42 +196,54 @@ def main():
     #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    if data_args.task_name is not None:
-        # Downloading and loading a dataset from the hub.
+    if all((data_args.train_file is None,
+            data_args.validation_file is None,
+            data_args.test_file is None)):
+        # Downloading and loading a dataset from the hub, since no files are provided
         datasets = load_dataset("glue", data_args.task_name)
-    elif data_args.train_file.endswith(".csv"):
-        # Loading a dataset from local csv files
-        datasets = load_dataset(
-            "csv", data_files={"train": data_args.train_file, "validation": data_args.validation_file}
-        )
     else:
-        # Loading a dataset from local json files
+        data_files = {}
+        for split, datafile in [("train", data_args.train_file),
+                                ("validation", data_args.validation_file),
+                                ("test", data_args.test_file)]:
+            if datafile:
+                data_files[split] = datafile
         datasets = load_dataset(
-            "json", data_files={"train": data_args.train_file, "validation": data_args.validation_file}
+            data_args.load_format, data_files=data_files
         )
+
+    logger.info(f"Loaded datasets: {datasets}")
+    if any("gold_label" in x for x in datasets.column_names.values()):
+        # Rename gold_label column to label
+        datasets = datasets.rename_column("gold_label", "label")
+
+    if "train" in datasets and training_args.do_train:
+        # Get the labels from the training dataset
+        training_labels = sorted(datasets[split].unique("label"))
+        # Convert Values to ClassLabels, if applicable
+        for split in datasets.keys():
+            if "label" in datasets[split].features and not isinstance(datasets[split].features["label"], ClassLabel):
+                # Filter out rows where the label is "-"
+                logger.info("Filtering out rows where the label is '-'")
+                datasets[split] = datasets[split].filter(lambda example: example['label'] != "-")
+                logger.info(f"Converting labels for split {split}")
+                new_features = datasets[split].features.copy()
+                class_feature = ClassLabel(names=training_labels)
+                new_features["label"] = class_feature
+                datasets[split] = datasets[split].map(lambda str_value: {"label": class_feature.str2int(str_value)}, input_columns="label")
+                datasets[split] = datasets[split].cast(new_features)
+
     # See more about loading any type of standard or custom dataset at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
     # Labels
     label_list = None
-    if data_args.task_name is not None:
-        is_regression = data_args.task_name == "stsb"
-        if not is_regression:
-            label_list = datasets["train"].features["label"].names
-            num_labels = len(label_list)
-        else:
-            num_labels = 1
+    is_regression = data_args.task_name == "stsb"
+    if not is_regression:
+        label_list = datasets["train"].features["label"].names
+        num_labels = len(label_list)
     else:
-        # Trying to have good defaults here, don't hesitate to tweak to your needs.
-        is_regression = datasets["train"].features["label"].dtype in ["float32", "float64"]
-        if is_regression:
-            num_labels = 1
-        else:
-            # A useful fast method:
-            # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.unique
-            label_list = datasets["train"].unique("label")
-            label_list.sort()  # Let's sort it for determinism
-            num_labels = len(label_list)
+        num_labels = 1
 
     # Load pretrained model and tokenizer
     #
@@ -317,18 +327,7 @@ def main():
             )
 
     # Preprocessing the datasets
-    if data_args.task_name is not None:
-        sentence1_key, sentence2_key = task_to_keys[data_args.task_name]
-    else:
-        # Again, we try to have some nice defaults but don't hesitate to tweak to your use case.
-        non_label_column_names = [name for name in datasets["train"].column_names if name != "label"]
-        if "sentence1" in non_label_column_names and "sentence2" in non_label_column_names:
-            sentence1_key, sentence2_key = "sentence1", "sentence2"
-        else:
-            if len(non_label_column_names) >= 2:
-                sentence1_key, sentence2_key = non_label_column_names[:2]
-            else:
-                sentence1_key, sentence2_key = non_label_column_names[0], None
+    sentence1_key, sentence2_key = task_to_keys[data_args.task_name]
 
     # Padding strategy
     if data_args.pad_to_max_length:
@@ -373,18 +372,14 @@ def main():
 
     datasets = datasets.map(preprocess_function, batched=True, load_from_cache_file=not data_args.overwrite_cache)
 
-    train_dataset = datasets["train"]
-    eval_dataset = datasets["validation_matched" if data_args.task_name == "mnli" else "validation"]
-    if data_args.task_name is not None:
-        test_dataset = datasets["test_matched" if data_args.task_name == "mnli" else "test"]
-
-    # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+    train_dataset = datasets.get("train")
+    eval_dataset = datasets.get("validation_matched" if data_args.task_name == "mnli" else "validation")
+    test_dataset = datasets.get("test_matched" if data_args.task_name == "mnli" else "test")
 
     # Get the metric function
     if data_args.task_name is not None:
-        metric = load_metric("glue", data_args.task_name)
+        replacement_metric_names = {"mnli-jsonl": "mnli"}
+        metric = load_metric("glue", replacement_metric_names.get(data_args.task_name, data_args.task_name))
     # TODO: When datasets metrics include regular accuracy, make an else here and remove special branch from
     # compute_metrics
 
@@ -404,7 +399,7 @@ def main():
             return {"accuracy": (preds == p.label_ids).astype(np.float32).mean().item()}
 
     # Initialize our Trainer
-    trainer = Trainer(
+    trainer = SaveBestTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -419,6 +414,9 @@ def main():
 
     # Training
     if training_args.do_train:
+        # Log a few random samples from the training set:
+        for index in random.sample(range(len(train_dataset)), 3):
+            logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
         trainer.train(
             model_path=model_args.model_name_or_path if os.path.isdir(model_args.model_name_or_path) else None
         )
@@ -429,6 +427,9 @@ def main():
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
 
+        # Log a few random samples from the eval set:
+        for index in random.sample(range(len(eval_dataset)), 3):
+            logger.info(f"Sample {index} of the eval set: {eval_dataset[index]}.")
         # Loop to handle MNLI double evaluation (matched, mis-matched)
         tasks = [data_args.task_name]
         eval_datasets = [eval_dataset]
@@ -451,7 +452,9 @@ def main():
 
     if training_args.do_predict:
         logger.info("*** Test ***")
-
+        # Log a few random samples from the eval set:
+        for index in random.sample(range(len(test_dataset)), 3):
+            logger.info(f"Sample {index} of the test set: {test_dataset[index]}.")
         # Loop to handle MNLI double evaluation (matched, mis-matched)
         tasks = [data_args.task_name]
         test_datasets = [test_dataset]
