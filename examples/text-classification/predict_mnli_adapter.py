@@ -23,18 +23,11 @@ def chunks(lst, n):
         yield lst[i : i + n]
 
 
-def int_to_device(device):
-    if device < 0:
-        return torch.device("cpu")
-    return torch.device(device)
-
-
 def main(mnli_path, model, adapter, adapter_type, batch_size, output_path, cuda_device, padding, max_length):
-    device = int_to_device(cuda_device)
-    print(f"Using device: {device}")
+    print(f"Using device: {cuda_device}")
     print(f"Loading model and tokenizer for {model}")
     tokenizer = AutoTokenizer.from_pretrained(model, padding=padding, max_length=max_length, truncation=True)
-    model = AutoModelWithHeads.from_pretrained(model).to(device)
+    model = AutoModelWithHeads.from_pretrained(model)
     adapter_name = model.load_adapter(adapter, config=adapter_type)
     model.set_active_adapters(adapter_name)
 
@@ -47,7 +40,7 @@ def main(mnli_path, model, adapter, adapter_type, batch_size, output_path, cuda_
             sentences.append((example["sentence1"], example["sentence2"]))
     print(f"Read {len(sentences)} sentences")
 
-    pipeline = TextClassificationPipeline(model=model, tokenizer=tokenizer)
+    pipeline = TextClassificationPipeline(model=model, tokenizer=tokenizer, device=cuda_device)
     print(f"Processing with a batch size of {batch_size}")
 
     predictions = []
