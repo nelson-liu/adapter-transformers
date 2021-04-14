@@ -52,6 +52,7 @@ task_to_keys = {
     "cola": ("sentence", None),
     "mnli": ("premise", "hypothesis"),
     "mnli-jsonl": ("sentence1", "sentence2"),
+    "sentiment-jsonl": ("text", None),
     "mrpc": ("sentence1", "sentence2"),
     "qnli": ("question", "sentence"),
     "qqp": ("question1", "question2"),
@@ -378,7 +379,7 @@ def main():
 
     # Get the metric function
     if data_args.task_name is not None:
-        replacement_metric_names = {"mnli-jsonl": "mnli"}
+        replacement_metric_names = {"mnli-jsonl": "mnli", "sentiment-jsonl": "sst2"}
         metric = load_metric("glue", replacement_metric_names.get(data_args.task_name, data_args.task_name))
     # TODO: When datasets metrics include regular accuracy, make an else here and remove special branch from
     # compute_metrics
