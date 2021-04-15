@@ -4,7 +4,8 @@ import json
 import numpy as np
 import torch
 from tqdm import tqdm
-from transformers import AutoModelWithHeads, AutoTokenizer, TextClassificationPipeline
+from transformers import AutoModelWithHeads, AutoTokenizer
+from truncating_pipeline import TruncatingTextClassificationPipeline
 
 
 def chunks(lst, n):
@@ -16,7 +17,7 @@ def chunks(lst, n):
 def main(data_path, model, adapter, adapter_type, batch_size, output_path, cuda_device, padding, max_length):
     print(f"Using device: {cuda_device}")
     print(f"Loading model and tokenizer for {model}")
-    tokenizer = AutoTokenizer.from_pretrained(model, padding=padding, max_length=max_length, truncation=True)
+    tokenizer = AutoTokenizer.from_pretrained(model)
     model = AutoModelWithHeads.from_pretrained(model)
     adapter_name = model.load_adapter(adapter, config=adapter_type)
     model.set_active_adapters(adapter_name)
@@ -28,13 +29,16 @@ def main(data_path, model, adapter, adapter_type, batch_size, output_path, cuda_
             sentences.append(example["text"])
     print(f"Read {len(sentences)} sentences")
 
-    pipeline = TextClassificationPipeline(model=model, tokenizer=tokenizer, device=cuda_device)
+    pipeline = TruncatingTextClassificationPipeline(model=model, tokenizer=tokenizer, device=cuda_device)
     print(f"Processing with a batch size of {batch_size}")
 
     predictions = []
     for batch in tqdm(chunks(sentences, batch_size)):
         with torch.no_grad():
-            model_output = pipeline(inputs=batch)
+            model_output = pipeline(inputs=batch,
+                                    max_length=max_length,
+                                    padding="max_length" if padding else padding,
+                                    truncation=True)
             predictions.extend(model_output)
 
     assert len(sentences) == len(predictions)
