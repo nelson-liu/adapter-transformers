@@ -1,5 +1,16 @@
 from transformers import Pipeline
 import numpy as np
+from transformers.file_utils import is_tf_available, is_torch_available
+
+if is_tf_available():
+    import tensorflow as tf
+
+    from transformers.modeling_tf_auto import TF_MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
+
+if is_torch_available():
+    import torch
+
+    from transformers.modeling_auto import MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
 
 class TruncatingPipeline(Pipeline):
     """
@@ -53,6 +64,18 @@ class TruncatingTextClassificationPipeline(TruncatingPipeline):
     the up-to-date list of available models on `huggingface.co/models
     <https://huggingface.co/models?filter=text-classification>`__.
     """
+    def __init__(self, return_all_scores: bool = False, **kwargs):
+        super().__init__(**kwargs)
+
+        self.check_model_type(
+            TF_MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
+            if self.framework == "tf"
+            else MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING
+        )
+
+        self.return_all_scores = return_all_scores
+
+
     def __call__(self, *args, **kwargs):
         """
         Classify the text(s) given as inputs.
