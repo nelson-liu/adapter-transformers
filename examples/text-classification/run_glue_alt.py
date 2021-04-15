@@ -219,7 +219,7 @@ def main():
 
     if "train" in datasets and training_args.do_train:
         # Get the labels from the training dataset
-        training_labels = sorted(datasets[split].unique("label"))
+        training_labels = sorted([x for x in datasets[split].unique("label") if x != "-"])
         # Convert Values to ClassLabels, if applicable
         for split in datasets.keys():
             if "label" in datasets[split].features and not isinstance(datasets[split].features["label"], ClassLabel):
